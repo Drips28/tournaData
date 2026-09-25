@@ -225,3 +225,81 @@ def anular(id_partido: int, user=Depends(require("admin"))):
         c.execute(text("UPDATE partidos SET equipo_visitante_id=NULL WHERE partido_origen_visita_id=:i"), {"i": id_partido})
         c.execute(text("UPDATE torneos SET estado='En Progreso', fecha_fin=NULL WHERE id_torneo=:t"), {"t": m[0]["id_torneo"]})
     return {"ok": True, "anulado_por": user["sub"]}
+
+
+# ---------- Gestión de equipos (Admin) ----------
+
+class EquipoIn(BaseModel):
+    nombre_oficial: str = Field(..., min_length=1, max_length=100)
+    tag: str = Field(..., min_length=1, max_length=10)
+    logo_url: str | None = None
+
+
+@app.get("/api/v1/equipos", tags=["equipos"])
+def listar_equipos():
+    """Lectura pública, igual que /torneos."""
+    with engine.connect() as c:
+        return q(c, "SELECT * FROM equipos ORDER BY nombre_oficial")
+
+
+@app.post("/api/v1/equipos", tags=["equipos"], status_code=201)
+def crear_equipo(e: EquipoIn, user=Depends(require("admin"))):
+    with engine.begin() as c:
+        if q(c, "SELECT 1 FROM equipos WHERE tag=:t", t=e.tag):
+            raise HTTPException(409, f"Ya existe un equipo con el TAG '{e.tag}'")
+        r = c.execute(text("""INSERT INTO equipos (nombre_oficial, tag, logo_url)
+                             VALUES (:n, :t, :l)"""),
+                      {"n": e.nombre_oficial, "t": e.tag, "l": e.logo_url})
+    return {"ok": True, "id_equipo": r.lastrowid, "creado_por": user["sub"]}
+
+
+@app.delete("/api/v1/equipos/{id_equipo}", tags=["equipos"])
+def eliminar_equipo(id_equipo: int, user=Depends(require("admin"))):
+    """Bloqueado por la base de datos (ON DELETE RESTRICT) si el equipo sigue
+    inscrito en algún torneo. Hay que darlo de baja del torneo primero."""
+    try:
+        with engine.begin() as c:
+            if not q(c, "SELECT 1 FROM equipos WHERE id_equipo=:i", i=id_equipo):
+                raise HTTPException(404, "Equipo no encontrado")
+            c.execute(text("DELETE FROM equipos WHERE id_equipo=:i"), {"i": id_equipo})
+    except DBAPIError:
+        raise HTTPException(409, "No se puede eliminar: el equipo sigue inscrito en uno o más "
+                                  "torneos. Quítalo de las inscripciones antes de borrarlo.")
+    return {"ok": True, "eliminado_por": user["sub"]}
+
+
+# ---------- Reinicio de torneo (Admin) ----------
+
+@app.post("/api/v1/torneos/{id_torneo}/reiniciar", tags=["torneos"])
+def reiniciar_torneo(id_torneo: int, user=Depends(require("admin"))):
+    """Regresa el torneo a su punto de partida para poder repetir la demo:
+    borra marcadores y estadísticas, deja solo la ronda 1 con sus equipos
+    originales, y limpia las rondas siguientes (que se llenan solas al jugar)."""
+    with engine.begin() as c:
+        if not q(c, "SELECT 1 FROM torneos WHERE id_torneo=:t", t=id_torneo):
+            raise HTTPException(404, "Torneo no encontrado")
+
+        c.execute(text("""DELETE s FROM estadisticas_partido s
+                          JOIN partidos p ON p.id_partido = s.id_partido
+                          JOIN fases_rondas f ON f.id_fase = p.id_fase
+                          WHERE f.id_torneo=:t"""), {"t": id_torneo})
+
+        c.execute(text("""UPDATE partidos p JOIN fases_rondas f ON f.id_fase = p.id_fase
+                          SET p.marcador_local=0, p.marcador_visitante=0,
+                              p.ganador_id=NULL, p.estado='Programado'
+                          WHERE f.id_torneo=:t"""), {"t": id_torneo})
+
+        # Solo se limpian los equipos de partidos que vienen de una ronda anterior;
+        # la ronda 1 (sin partido_origen) conserva su emparejamiento original.
+        c.execute(text("""UPDATE partidos p JOIN fases_rondas f ON f.id_fase = p.id_fase
+                          SET p.equipo_local_id=NULL
+                          WHERE f.id_torneo=:t AND p.partido_origen_local_id IS NOT NULL"""),
+                  {"t": id_torneo})
+        c.execute(text("""UPDATE partidos p JOIN fases_rondas f ON f.id_fase = p.id_fase
+                          SET p.equipo_visitante_id=NULL
+                          WHERE f.id_torneo=:t AND p.partido_origen_visita_id IS NOT NULL"""),
+                  {"t": id_torneo})
+
+        c.execute(text("UPDATE torneos SET estado='En Progreso', fecha_fin=NULL WHERE id_torneo=:t"),
+                  {"t": id_torneo})
+    return {"ok": True, "reiniciado_por": user["sub"]}
